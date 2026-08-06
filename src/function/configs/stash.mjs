@@ -6,6 +6,7 @@ desc: |-
   2.按配置替换空气质量数据
   3.按配置补充下一小时降水数据
   4.按配置融合天气数据
+  5.按配置补全天气预警摘要与详情
 author: |-
   meme[https://github.com/meme]
 homepage: "https://github.com/meme-lau/weatherkit-proxy"
@@ -29,7 +30,7 @@ rules:
 - AND,((IP-CIDR,65.199.22.0/23,no-resolve),(PROTOCOL,UDP),(DST-PORT,443)),REJECT-NO-DROP
 - AND,((OR,((IP-ASN,714,no-resolve),(IP-ASN,6185,no-resolve))),(PROTOCOL,QUIC)),REJECT-DROP
 - DOMAIN-SUFFIX,weatherkit.apple.com,DIRECT
-- DOMAIN-SUFFIX,__DOMAIN__,DIRECT
+- DOMAIN-SUFFIX,__DOMAIN__,__DOMAIN_POLICY__
 - DOMAIN,weather-analytics-events.apple.com,REJECT-DROP
 - DOMAIN-SUFFIX,tthr.apple.com,REJECT-DROP
 - DOMAIN,tether.edge.apple,REJECT-DROP
@@ -42,4 +43,5 @@ http:
 # __AIR_QUALITY_SCALE_PROXY_START__
   - ^https?:\\/\\/weatherkit\\.apple\\.com\\/api\\/v1\\/airQualityScale\\/ https://__PLAIN_HOST__/api/v1/airQualityScale/ transparent
 # __AIR_QUALITY_SCALE_PROXY_END__
-  - ^https?:\\/\\/weatherkit\\.apple\\.com\\/api\\/v2\\/weather\\/ https://__HOST__/api/v2/weather/ transparent`;
+  - ^https?:\\/\\/weatherkit\\.apple\\.com\\/api\\/v2\\/weather\\/ https://__HOST__/api/v2/weather/ transparent
+  - ^https?:\\/\\/weatherkit\\.apple\\.com\\/api\\/v1\\/weatherAlerts\\?([^#]*&ids=-?[0-9]+(?:\\.[0-9]+)?,-?[0-9]+(?:\\.[0-9]+)?(?:&[^#]*)?)$ https://__HOST__/api/v1/weatherAlerts?$1 transparent`;

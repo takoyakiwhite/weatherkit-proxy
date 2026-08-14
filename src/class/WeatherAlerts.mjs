@@ -1,37 +1,33 @@
 /**
- * WeatherKit weather-alert helpers adapted from NSRingo/WeatherKit v3.2.0.
+ * WeatherKit weather-alert helpers adapted from NSRingo/WeatherKit v3.2.2.
  *
- * The proxy only needs coordinate-based alert details, so the upstream legacy
- * QWeather HTML scraper is intentionally not included here.
+ * QWeather's public severe-weather page is the only enrichment source.
+ * WeatherKit keeps Apple's original alert data untouched.
  */
 export default class WeatherAlerts {
     /** Resolve weather-alert enrichment to an explicitly supported provider. */
     static ResolveProvider(settings) {
         switch (settings?.WeatherAlerts?.Provider) {
-            case "ColorfulClouds":
-            case "QWeather":
-                return settings.WeatherAlerts.Provider;
+            case "QWeatherWeb":
+                return "QWeatherWeb";
             case "WeatherKit":
                 return "WeatherKit";
+            // Migrate configurations created before API alert providers were
+            // removed without issuing another API request.
+            case "ColorfulClouds":
+            case "QWeather":
             case undefined:
             case null:
             case "":
-                return "QWeather";
+                return "QWeatherWeb";
             default:
                 return "WeatherKit";
         }
     }
 
-    /** QWeather has an upstream public Key; Caiyun CAP requires an explicit authorized token. */
+    /** QWeather Web needs no API credential; WeatherKit disables enrichment. */
     static CanUseProvider(settings, providerName = WeatherAlerts.ResolveProvider(settings)) {
-        switch (providerName) {
-            case "ColorfulClouds":
-                return String(settings?.API?.ColorfulClouds?.Token ?? "").trim().length > 0;
-            case "QWeather":
-                return true;
-            default:
-                return false;
-        }
+        return providerName === "QWeatherWeb";
     }
 
     static ParseCoordinateIdentifier(ids) {
@@ -57,14 +53,18 @@ export default class WeatherAlerts {
     static mergeAlerts(target = [], source = []) {
         if (!Array.isArray(target) || !Array.isArray(source) || !target.length || !source.length) return target;
 
+        WeatherAlerts.#DeduplicateAlertsInPlace(target);
+        const sourceAlerts = WeatherAlerts.#DeduplicateAlerts(source);
         const usedSourceIndexes = new Set();
         for (let targetIndex = 0; targetIndex < target.length; targetIndex++) {
             const targetAlert = target[targetIndex];
-            const sourceIndex = WeatherAlerts.#FindSourceAlert(targetAlert, source, usedSourceIndexes, targetIndex);
-            if (!targetAlert || sourceIndex < 0 || !source[sourceIndex]) continue;
+            const sourceIndex = WeatherAlerts.#FindSourceAlert(targetAlert, sourceAlerts, usedSourceIndexes, targetIndex);
+            if (!targetAlert || sourceIndex < 0 || !sourceAlerts[sourceIndex]) continue;
             usedSourceIndexes.add(sourceIndex);
-            WeatherAlerts.#FillAlert(targetAlert, source[sourceIndex]);
+            WeatherAlerts.#FillAlert(targetAlert, sourceAlerts[sourceIndex]);
         }
+        WeatherAlerts.#DeduplicateAlertsInPlace(target);
+        WeatherAlerts.#SortAlerts(target);
         return target;
     }
 
@@ -75,7 +75,7 @@ export default class WeatherAlerts {
         const contextAreaId = identifier.match(/-(\d+)$/)?.[1];
         const attributionURL = String(context?.attributionUrl ?? "");
 
-        return alerts.map((alert, precedence) => {
+        return WeatherAlerts.#SortAlerts(WeatherAlerts.#DeduplicateAlerts(alerts)).map((alert, precedence) => {
             const uid = WeatherAlerts.#StableUUID(`${identifier}:${alert.identifier ?? precedence}`);
             const messages = [];
             for (const text of [alert.message, alert.standard, alert.guidelines?.filter(Boolean).join("\n")]) {
@@ -83,7 +83,8 @@ export default class WeatherAlerts {
             }
             if (!messages.length && alert.description) messages.push({ language: context.language, text: alert.description });
 
-            const responses = WeatherAlerts.#BuildResponses(alert.guidelines, alert.responses);
+            const cancelled = WeatherAlerts.#IsCancelled(alert);
+            const responses = cancelled ? ["allClear"] : WeatherAlerts.#BuildResponses(alert.guidelines, alert.responses);
             const areaId = alert.areaId || contextAreaId;
             const areaName = alert.areaName || extracted?.areaName;
             const effectiveTime = alert.effectiveTime ?? alert.issuedTime;
@@ -92,6 +93,7 @@ export default class WeatherAlerts {
             const eventEndTime = alert.eventEndTime ?? (alert.expireTime ? expireTime : undefined);
             const source = alert.source || extracted?.source || "QWeather";
             const importance = alert.importance || WeatherAlerts.#ImportanceFromSeverity(alert.severity);
+            const description = WeatherAlerts.#NormalizeWeatherAlertTitle(alert.description, alert.eventName);
 
             return {
                 id: uid,
@@ -100,7 +102,7 @@ export default class WeatherAlerts {
                 attributionURL,
                 certainty: alert.certainty || "unknown",
                 countryCode: context.countryCode ?? "",
-                description: alert.description,
+                description,
                 detailsUrl: `#${uid}`,
                 effectiveTime,
                 ...(eventEndTime ? { eventEndTime } : {}),
@@ -119,7 +121,7 @@ export default class WeatherAlerts {
                 severity: alert.severity,
                 source,
                 ...(alert.token ? { token: alert.token } : {}),
-                urgency: alert.urgency || "unknown",
+                urgency: cancelled ? "past" : alert.urgency || "unknown",
             };
         });
     }
@@ -134,14 +136,24 @@ export default class WeatherAlerts {
         WeatherAlerts.#FillTime(target, "issuedTime", source.issuedTime ?? source.effectiveTime);
         WeatherAlerts.#FillDescription(target, source);
         WeatherAlerts.#FillText(target, "source", source.source);
-        WeatherAlerts.#FillEnum(target, "phenomenon", source.phenomenon);
+        // WK2 exposes this field to WeatherKit clients as the concrete alert
+        // summary. Keep the provider's CAP category for the v1 details JSON,
+        // but do not replace a missing Apple summary with a generic value such
+        // as "Met"; WeatherKit clients consume this as the event summary.
+        WeatherAlerts.#FillEnum(target, "phenomenon", source.eventName || source.phenomenon);
         WeatherAlerts.#FillText(target, "token", source.token);
-        WeatherAlerts.#FillResponses(target, source);
+        const cancelled = WeatherAlerts.#IsCancelled(source);
+        if (cancelled) {
+            target.responses = ["ALLCLEAR"];
+            target.urgency = "PAST";
+        } else {
+            WeatherAlerts.#FillResponses(target, source);
+            WeatherAlerts.#FillFlatBufferEnum(target, "urgency", source.urgency);
+        }
         WeatherAlerts.#FillFlatBufferEnum(target, "severity", source.severity, ["UNKNOWN"]);
         WeatherAlerts.#FillFlatBufferEnum(target, "certainty", source.certainty);
         WeatherAlerts.#FillFlatBufferEnum(target, "importance", source.importance || WeatherAlerts.#ImportanceFromSeverity(source.severity));
         WeatherAlerts.#FillFlatBufferEnum(target, "significance", source.significance);
-        WeatherAlerts.#FillFlatBufferEnum(target, "urgency", source.urgency);
     }
 
     static #FillText(target, key, sourceValue) {
@@ -152,11 +164,16 @@ export default class WeatherAlerts {
 
     static #FillDescription(target, source) {
         const current = String(target?.description ?? "").trim();
-        const value = String(source?.description ?? "").trim();
+        const value = WeatherAlerts.#NormalizeWeatherAlertTitle(source?.description, source?.eventName);
         if (!value) return;
         const currentKey = WeatherAlerts.#NormalizeMatchText(current);
+        const eventNameKey = WeatherAlerts.#NormalizeMatchText(source?.eventName);
         const phenomenonKey = WeatherAlerts.#NormalizeMatchText(source?.phenomenon);
-        if (!currentKey || currentKey === phenomenonKey || currentKey === "other" || currentKey === "unknown") target.description = value;
+        const currentType = WeatherAlerts.#NormalizeAlertTypeText(current);
+        const sameAlertType = Boolean(currentType) && currentType === WeatherAlerts.#NormalizeAlertTypeText(value);
+        const enrichesUnleveledTitle = sameAlertType && !WeatherAlerts.#HasAlertColor(current);
+        const replaceGeneric = WeatherAlerts.#IsGenericDescription(current) && !WeatherAlerts.#IsGenericDescription(value);
+        if (!currentKey || currentKey === eventNameKey || currentKey === phenomenonKey || enrichesUnleveledTitle || replaceGeneric) target.description = value;
     }
 
     static #FillEnum(target, key, sourceValue, fallbackValues = ["unknown", "Other"]) {
@@ -210,6 +227,7 @@ export default class WeatherAlerts {
         const sourceToken = WeatherAlerts.#NormalizeMatchText(source?.token);
         const targetDescription = WeatherAlerts.#NormalizeMatchText(target?.description);
         const sourceDescription = WeatherAlerts.#NormalizeMatchText(source?.description);
+        const sourceEventName = WeatherAlerts.#NormalizeMatchText(source?.eventName);
         const sourceMessage = WeatherAlerts.#NormalizeMatchText(source?.message);
         const targetPhenomenon = WeatherAlerts.#NormalizeMatchText(target?.phenomenon);
         const sourcePhenomenon = WeatherAlerts.#NormalizeMatchText(source?.phenomenon);
@@ -219,6 +237,7 @@ export default class WeatherAlerts {
         if (targetAreaId && sourceAreaId && targetAreaId === sourceAreaId) score += 60;
         if (targetAreaName && sourceAreaName && targetAreaName === sourceAreaName) score += 40;
         if (targetToken && sourceToken && targetToken === sourceToken) score += 50;
+        if (targetDescription && sourceEventName && targetDescription === sourceEventName) score += 50;
         if (targetDescription && sourcePhenomenon && targetDescription === sourcePhenomenon) score += 50;
         if (targetDescription && sourceDescription && sourceDescription.includes(targetDescription)) score += 40;
         if (targetDescription && sourceMessage && sourceMessage.includes(targetDescription)) score += 30;
@@ -232,7 +251,7 @@ export default class WeatherAlerts {
             .trim()
             .toLowerCase()
             .replace(/\s+/g, "")
-            .replace(/预警信号|预警|警报|报告/g, "");
+            .replace(/预警信号|預警信號|预警|預警|警报|警報|报告|報告/g, "");
     }
 
     static #ToUnixSeconds(value) {
@@ -257,6 +276,153 @@ export default class WeatherAlerts {
             default:
                 return "normal";
         }
+    }
+
+    static #SortAlerts(alerts) {
+        return alerts.sort((left, right) => {
+            const cancellationOrder = Number(WeatherAlerts.#IsCancelled(left)) - Number(WeatherAlerts.#IsCancelled(right));
+            if (cancellationOrder) return cancellationOrder;
+            return WeatherAlerts.#SeverityRank(right?.severity) - WeatherAlerts.#SeverityRank(left?.severity);
+        });
+    }
+
+    static #DeduplicateAlerts(alerts) {
+        const selectedByType = new Map();
+        for (let index = 0; index < alerts.length; index++) {
+            const alert = alerts[index];
+            const type = WeatherAlerts.#AlertTypeKey(alert);
+            if (!type) continue;
+
+            const candidate = { index, time: WeatherAlerts.#AlertTime(alert) };
+            const selected = selectedByType.get(type);
+            if (!selected || candidate.time > selected.time) selectedByType.set(type, candidate);
+        }
+
+        return alerts.filter((alert, index) => {
+            const type = WeatherAlerts.#AlertTypeKey(alert);
+            return !type || selectedByType.get(type)?.index === index;
+        });
+    }
+
+    static #DeduplicateAlertsInPlace(alerts) {
+        const deduplicated = WeatherAlerts.#DeduplicateAlerts(alerts);
+        if (deduplicated.length !== alerts.length) alerts.splice(0, alerts.length, ...deduplicated);
+        return alerts;
+    }
+
+    static #AlertTypeKey(alert) {
+        const eventName = WeatherAlerts.#NormalizeAlertTypeText(alert?.eventName);
+        if (eventName && !WeatherAlerts.#IsGenericDescription(eventName)) return `event:${eventName}`;
+
+        const phenomenon = WeatherAlerts.#NormalizeAlertTypeText(alert?.phenomenon);
+        if (phenomenon && !WeatherAlerts.#IsGenericDescription(phenomenon) && !WeatherAlerts.#IsCAPCategory(phenomenon)) return `phenomenon:${phenomenon}`;
+
+        const token = WeatherAlerts.#NormalizeMatchText(alert?.token);
+        if (token && !["other", "unknown"].includes(token)) return `token:${token}`;
+
+        const description = WeatherAlerts.#NormalizeAlertTypeText(alert?.description);
+        if (description && !WeatherAlerts.#IsGenericDescription(description)) return `description:${description}`;
+        return "";
+    }
+
+    static #IsCAPCategory(value) {
+        return new Set(["geo", "met", "safety", "security", "rescue", "fire", "health", "env", "transport", "infra", "cbrne", "other"]).has(WeatherAlerts.#NormalizeMatchText(value));
+    }
+
+    static #NormalizeAlertTypeText(value) {
+        const withoutColor = String(value ?? "").replace(/(?:白|灰|绿|綠|蓝|藍|黄|黃|琥珀|橙|红|紅|紫|黑)色|\b(?:white|gr[ae]y|green|blue|yellow|amber|orange|red|purple|black)\b/gi, "");
+        return WeatherAlerts.#NormalizeMatchText(withoutColor)
+            .replace(/^(?:解除|取消|撤销|撤消|終止|终止|cancelled|canceled|allclear)/i, "")
+            .replace(/[。．.!！]+$/gu, "");
+    }
+
+    static #HasAlertColor(value) {
+        return /(?:白|灰|绿|綠|蓝|藍|黄|黃|琥珀|橙|红|紅|紫|黑)色|\b(?:white|gr[ae]y|green|blue|yellow|amber|orange|red|purple|black)\b/i.test(String(value ?? ""));
+    }
+
+    static #AlertTime(alert) {
+        for (const value of [alert?.issuedTime, alert?.effectiveTime, alert?.reportedAt]) {
+            if (typeof value === "number" && Number.isFinite(value)) return value < 1_000_000_000_000 ? value * 1000 : value;
+            const time = Date.parse(String(value ?? ""));
+            if (!Number.isNaN(time)) return time;
+        }
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    static #IsGenericDescription(value) {
+        return new Set(["恶劣天气", "惡劣天氣", "极端天气", "極端天氣", "severeweather", "severeweatheralert", "extremeweather", "extremeweatheralert", "weatheralert", "other", "unknown", "其他", "其它", "未知"]).has(WeatherAlerts.#NormalizeMatchText(value));
+    }
+
+    /** Normalize provider headlines without losing CAP event names or levels. */
+    static #NormalizeWeatherAlertTitle(description, eventName = "") {
+        const title = String(description ?? "").trim();
+        const fallback = WeatherAlerts.#TrimWeatherAlertTitle(eventName);
+        if (!title) return fallback;
+
+        const chinese = title.match(/^.+?(?:发布|發布|更新)\s*[:：]?\s*(.+)$/);
+        if (chinese?.[1]) return WeatherAlerts.#TrimWeatherAlertTitle(chinese[1]);
+
+        const issued = title.match(/^(.+?)\s+issued\b\s*[:：]?\s*(.+)$/i);
+        if (issued?.[1] && issued?.[2]) {
+            const titleBeforeIssued = WeatherAlerts.#TrimWeatherAlertTitle(issued[1]);
+            const fallbackMatchesPrefix = Boolean(fallback) && WeatherAlerts.#NormalizeMatchText(fallback) === WeatherAlerts.#NormalizeMatchText(titleBeforeIssued);
+            return fallbackMatchesPrefix ? fallback : WeatherAlerts.#FormatTranslatedEnglishAlertTitle(issued[2]) || fallback;
+        }
+
+        const issues = title.match(/^.+?\s+issues?\b\s*[:：]?\s*(.+)$/i);
+        return issues?.[1] ? WeatherAlerts.#FormatTranslatedEnglishAlertTitle(issues[1]) || fallback : WeatherAlerts.#TrimWeatherAlertTitle(title) || fallback;
+    }
+
+    static #FormatTranslatedEnglishAlertTitle(title) {
+        return WeatherAlerts.#TrimWeatherAlertTitle(title)
+            .replace(/^(?:a|an|the)\s+/i, "")
+            .replace(/\b\p{L}/gu, character => character.toUpperCase());
+    }
+
+    static #TrimWeatherAlertTitle(title) {
+        return String(title ?? "")
+            .trim()
+            .replace(/\s*[。．.]+\s*$/gu, "")
+            .replace(/预警信号$/u, "预警")
+            .replace(/預警信號$/u, "預警");
+    }
+
+    static #IsCancelled(alert) {
+        if (alert?.cancelled === true) return true;
+        if (
+            String(alert?.urgency ?? "")
+                .trim()
+                .toLowerCase() === "past"
+        )
+            return true;
+        if (
+            (alert?.responses ?? []).some(response =>
+                ["allclear", "all_clear"].includes(
+                    String(response ?? "")
+                        .trim()
+                        .replace(/[\s-]+/g, "")
+                        .toLowerCase(),
+                ),
+            )
+        )
+            return true;
+        return /(?:解除|取消|撤销|撤消).{0,30}(?:预警|預警|警报|警報|警示)|\b(?:cancelled|canceled|all[ -]?clear)\b/i.test([alert?.description, alert?.message].map(value => String(value ?? "")).join("\n"));
+    }
+
+    static #SeverityRank(severity) {
+        return (
+            {
+                unknown: 0,
+                minor: 1,
+                moderate: 2,
+                severe: 3,
+                extreme: 4,
+            }[
+                String(severity ?? "")
+                    .trim()
+                    .toLowerCase()
+            ] ?? 0
+        );
     }
 
     static #BuildResponses(guidelines, preferredResponses = []) {

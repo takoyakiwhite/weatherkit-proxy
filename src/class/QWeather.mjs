@@ -8,45 +8,21 @@ export const QWEATHER_PUBLIC_TOKEN = "bdd98ec1d87747f3a2e8b1741a5af796";
 export const QWEATHER_ALERT_TIMEOUT_SECONDS = 10;
 
 export default class QWeather {
+    static #MaximumWeatherAlertPageSize = 2 * 1024 * 1024;
+
     constructor(parameters, token, host = "api.qweather.com") {
         this.Name = "QWeather";
-        this.Version = "5.1.0";
+        this.Version = "5.2.1";
         Console.debug(`🟧 ${this.Name} v${this.Version}`);
         this.endpoint = `https://${host || "api.qweather.com"}`;
         this.headers = { "X-QW-Api-Key": String(token ?? "").trim() || QWEATHER_PUBLIC_TOKEN };
         this.version = parameters.version;
-        const language = String(parameters.language ?? "")
-            .trim()
-            .toLowerCase();
-        switch (language) {
-            case "":
-                this.language = "zh";
-                break;
-            case "zh-cn":
-            case "zh-sg":
-            case "zh-hans-cn":
-                this.language = "zh-hans";
-                break;
-            case "zh-hant-hk":
-            case "zh-hant-mo":
-            case "zh-hant-tw":
-            case "zh-hk":
-            case "zh-mo":
-            case "zh-tw":
-                this.language = "zh-hant";
-                break;
-            case "en-au":
-            case "en-ca":
-            case "en-gb":
-            case "en-us":
-                this.language = "en";
-                break;
-            default:
-                this.language = language;
-        }
+        const language = String(parameters.language ?? "").trim();
+        this.language = this.#Config.Language[language.toLowerCase()] ?? (language || this.#Config.Language[""]);
         this.latitude = parameters.latitude;
         this.longitude = parameters.longitude;
         this.country = parameters.country;
+        this.weatherKitLanguage = String(parameters.weatherKitLanguage ?? parameters.language ?? "").trim() || "zh-CN";
     }
 
     #cache = {
@@ -55,6 +31,28 @@ export default class QWeather {
     };
 
     #Config = {
+        Language: {
+            "": "zh",
+            en: "en",
+            "en-au": "en",
+            "en-ca": "en",
+            "en-gb": "en",
+            "en-us": "en",
+            ja: "ja",
+            "ja-jp": "ja",
+            zh: "zh",
+            "zh-cn": "zh-hans",
+            "zh-sg": "zh-hans",
+            "zh-hans": "zh-hans",
+            "zh-hans-cn": "zh-hans",
+            "zh-hant": "zh-hant",
+            "zh-hant-hk": "zh-hant",
+            "zh-hant-mo": "zh-hant",
+            "zh-hant-tw": "zh-hant",
+            "zh-hk": "zh-hant",
+            "zh-mo": "zh-hant",
+            "zh-tw": "zh-hant",
+        },
         Pollutants: {
             co: "CO",
             no: "NO",
@@ -178,6 +176,162 @@ export default class QWeather {
         return nearest;
     }
 
+    /** Determine whether ids is a QWeather severe-weather page identifier. */
+    static IsWeatherAlertPageIdentifier(ids) {
+        return /^[\p{L}\p{N}._'-]+-[0-9]{9}$/u.test(String(ids ?? "").trim());
+    }
+
+    /** Extract a location identifier from an Apple-provided QWeather details URL. */
+    static ParseWeatherAlertPageURL(value) {
+        try {
+            const url = new URL(value);
+            if (url.protocol !== "https:" || url.hostname !== "www.qweather.com") return undefined;
+            if (url.search !== "?from=AppleWeatherService" || url.hash) return undefined;
+            const identifier = decodeURIComponent(url.pathname.match(/^\/{1,2}(?:en\/)?severe-weather\/([^/]+)\.html$/)?.[1] ?? "");
+            return QWeather.IsWeatherAlertPageIdentifier(identifier) ? identifier : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Build the public QWeather severe-weather page URL for a location identifier. */
+    static BuildWeatherAlertPageURL(identifier, language = "zh-CN", includeAppleSource = true) {
+        identifier = String(identifier ?? "").trim();
+        if (!QWeather.IsWeatherAlertPageIdentifier(identifier)) return undefined;
+
+        const url = new URL("https://www.qweather.com");
+        url.pathname = String(language).toLowerCase().startsWith("en") ? `/en/severe-weather/${identifier}.html` : `/severe-weather/${identifier}.html`;
+        if (includeAppleSource) url.searchParams.set("from", "AppleWeatherService");
+        return url;
+    }
+
+    /** Build the Apple details URL whose follow-up request is handled by this proxy. */
+    static BuildAppleAlertDetailsURL(identifier, language = "zh-CN") {
+        if (!QWeather.IsWeatherAlertPageIdentifier(identifier)) return undefined;
+        return `https://weatherkit.apple.com/alertDetails/index.html?ids=${encodeURIComponent(identifier)}&lang=${encodeURIComponent(language)}&party=qweather`;
+    }
+
+    /** Extract normalized alert records from a QWeather severe-weather page. */
+    static ExtractWeatherAlertPage(html) {
+        const sourceHtml = String(html ?? "");
+        let city = QWeather.#FirstWeatherAlertPageMatch(sourceHtml, /<h1[^>]*class=["'][^"']*c-submenu__location[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i);
+        if (!city) {
+            const titleText = QWeather.#FirstWeatherAlertPageMatch(sourceHtml, /<title>([\s\S]*?)<\/title>/i);
+            city = titleText.replace(/\s*(?:severe weather warning|灾害预警|天气预警).*$/i, "").trim();
+        }
+        const administration = QWeather.#FirstWeatherAlertPageMatch(sourceHtml, /<span[^>]*class=["'][^"']*c-submenu__location-adm[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+        const dataSource = QWeather.#FirstWeatherAlertPageMatch(sourceHtml, /<a[^>]*class=["'][^"']*data-source__txt[^"']*["'][^>]*>([\s\S]*?)<\/a>/i)
+            .replace(/^(?:预警数据来源|Warning data source)\s*[:：]\s*/i, "")
+            .trim();
+        const starts = Array.from(sourceHtml.matchAll(/<div[^>]*class=["']([^"']*\bc-city-warning-events\b[^"']*)["'][^>]*>/gi), match => ({
+            index: match.index,
+            contentStart: match.index + match[0].length,
+            className: match[1],
+        }));
+        const alerts = [];
+
+        for (const [index, start] of starts.entries()) {
+            let end = index + 1 < starts.length ? starts[index + 1].index : sourceHtml.length;
+            const nearby = sourceHtml.indexOf('<div class="c-city-warning-around">', start.contentStart);
+            if (nearby !== -1 && nearby < end) end = nearby;
+            const block = sourceHtml.slice(start.contentStart, end);
+            const description = QWeather.#FirstWeatherAlertPageMatch(block, /<h3[^>]*>([\s\S]*?)<\/h3>/i);
+            const issueText = QWeather.#FirstWeatherAlertPageMatch(block, /<p[^>]*>\s*((?:Issue\s+date|发布\s*日期)\s*[:：][\s\S]*?)<\/p>/i)
+                .replace(/^(?:Issue\s+date|发布\s*日期)\s*[:：]\s*/i, "")
+                .trim();
+            const message = QWeather.#FirstWeatherAlertPageMatch(block, /<p[^>]*class=["'][^"']*warning-events__txt[^"']*["'][^>]*>([\s\S]*?)<\/p>/i);
+            const standardBlock = block.match(/<div[^>]*class=["'][^"']*warning-explain[^"']*["'][^>]*>([\s\S]*?)<\/div>/i)?.[1] ?? "";
+            const standard = QWeather.#FirstWeatherAlertPageMatch(standardBlock, /<h4[^>]*>[\s\S]*?<\/h4>\s*<p[^>]*>([\s\S]*?)<\/p>/i);
+            const guideBlock = block.match(/<div[^>]*class=["'][^"']*warning-defense__txt[^"']*["'][^>]*>([\s\S]*?)<\/div>/i)?.[1] ?? "";
+            const guidelines = Array.from(guideBlock.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi), match =>
+                QWeather.#DecodeWeatherAlertPageHTML(match[1])
+                    .replace(/^\s*\d+[.、]\s*/, "")
+                    .trim(),
+            ).filter(Boolean);
+            const normalizedIssueText = issueText && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(issueText) ? `${issueText.replace(" ", "T")}+08:00` : issueText;
+            const issueDate = new Date(normalizedIssueText);
+            if ((!description && !message) || Number.isNaN(issueDate.getTime())) continue;
+
+            const headline = description || message;
+            const parsedHeadline = QWeather.#ParseWeatherAlertPageHeadline(headline);
+            const source = parsedHeadline.source || dataSource || "QWeather";
+            const classColor = start.className.match(/warning--(white|gray|green|blue|yellow|amber|orange|red|purple|black)/i)?.[1];
+            const warningColor = QWeather.#NormalizeWeatherAlertColor(classColor, headline, message);
+            const cancelled = QWeather.#IsCancelledWeatherAlertText(headline, message);
+
+            alerts.push({
+                ...(cancelled ? { cancelled: true } : {}),
+                description: headline,
+                ...(parsedHeadline.eventName ? { eventName: parsedHeadline.eventName } : {}),
+                guidelines,
+                issuedTime: issueDate.toISOString(),
+                message,
+                reportedAt: issueDate.toISOString(),
+                ...(cancelled ? { responses: ["allClear"] } : {}),
+                severity: QWeather.#WeatherAlertSeverityFromColor(warningColor),
+                source,
+                standard,
+                urgency: cancelled ? "past" : QWeather.#WeatherAlertUrgencyFromColor(warningColor),
+            });
+        }
+
+        return {
+            alerts,
+            areaName: city || administration,
+            source: alerts.find(alert => alert?.source)?.source || dataSource || "QWeather",
+        };
+    }
+
+    /** Fetch and extract a QWeather severe-weather page. */
+    static async FetchWeatherAlertPage(identifier, language = "zh-CN", requestHeaders = {}) {
+        const sourceUrl = QWeather.BuildWeatherAlertPageURL(identifier, language);
+        if (!sourceUrl) return { alerts: [], areaName: "", source: "QWeather" };
+
+        const headerEntries = typeof requestHeaders?.entries === "function" ? Array.from(requestHeaders.entries()) : Object.entries(requestHeaders ?? {});
+        const normalizedHeaders = Object.fromEntries(headerEntries.map(([key, value]) => [String(key).toLowerCase(), value]));
+        const sourceHeaders = {
+            Accept: "text/html,application/xhtml+xml",
+            "Accept-Language": String(normalizedHeaders["accept-language"] ?? language),
+            Referer: "https://www.qweather.com/",
+            "User-Agent": String(normalizedHeaders["user-agent"] ?? "").trim() || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        };
+
+        Console.info("☑️ QWeather.FetchWeatherAlertPage", `url: ${sourceUrl}`, `language: ${language}`);
+        const sourceResponse = await fetch({
+            url: sourceUrl.toString(),
+            headers: sourceHeaders,
+            timeout: QWEATHER_ALERT_TIMEOUT_SECONDS,
+        });
+        const contentType = (typeof sourceResponse.headers?.get === "function" ? sourceResponse.headers.get("Content-Type") : undefined) ?? sourceResponse.headers?.["content-type"] ?? sourceResponse.headers?.["Content-Type"] ?? "";
+        Console.info("QWeather.FetchWeatherAlertPage", `status: ${sourceResponse.statusCode ?? sourceResponse.status}`, `contentType: ${contentType || "undefined"}`);
+        if (sourceResponse.ok === false) {
+            Console.warn("QWeather.FetchWeatherAlertPage", `upstreamStatus: ${sourceResponse.statusCode ?? sourceResponse.status}`);
+            return { alerts: [], areaName: "", source: "QWeather" };
+        }
+        if (!contentType.toLowerCase().includes("text/html")) {
+            Console.warn("QWeather.FetchWeatherAlertPage", `unexpectedContentType: ${contentType || "undefined"}`);
+            return { alerts: [], areaName: "", source: "QWeather" };
+        }
+
+        const html = String(sourceResponse.body ?? "");
+        const sourceSize = new TextEncoder().encode(html).byteLength;
+        Console.debug("QWeather.FetchWeatherAlertPage", `bodyBytes: ${sourceSize}`);
+        if (sourceSize > QWeather.#MaximumWeatherAlertPageSize) throw new RangeError("QWeather alert page is too large");
+
+        const extracted = QWeather.ExtractWeatherAlertPage(html);
+        const areaId = String(identifier).match(/-(\d+)$/)?.[1];
+        const result = {
+            ...extracted,
+            alerts: extracted.alerts.map(alert => ({
+                ...alert,
+                ...(areaId && !alert.areaId ? { areaId } : {}),
+                ...(extracted.areaName && !alert.areaName ? { areaName: extracted.areaName } : {}),
+            })),
+        };
+        Console.info("✅ QWeather.FetchWeatherAlertPage", `alerts: ${result.alerts.length}`, `source: ${result.source}`);
+        return result;
+    }
+
     async GeoAPI(path = "city/lookup") {
         Console.debug("☑️ GeoAPI");
         const request = {
@@ -209,40 +363,35 @@ export default class QWeather {
         return metadata;
     }
 
-    /** Fetch and normalize QWeather's current severe-weather alerts. */
-    async WeatherAlert() {
-        Console.debug("☑️ WeatherAlert");
+    /** Fetch a QWeather page referenced by Apple and normalize its alert data. */
+    async WeatherAlertWeb(url, requestHeaders = {}, language = this.weatherKitLanguage) {
+        Console.debug("☑️ WeatherAlertWeb");
+        const identifier = QWeather.ParseWeatherAlertPageURL(url);
+        if (!identifier) {
+            Console.debug("✅ WeatherAlertWeb", "Unsupported URL");
+            return undefined;
+        }
+        const weatherKitLanguage = String(language ?? "").trim() || this.weatherKitLanguage;
+
         const failedWeatherAlerts = {
             alerts: [],
             areaName: "",
-            source: "国家预警信息发布中心",
+            source: "QWeather",
+            attributionUrl: String(url),
+            detailsUrl: QWeather.BuildAppleAlertDetailsURL(identifier, weatherKitLanguage),
+            identifier,
         };
-        const request = {
-            url: `${this.endpoint}/weatheralert/v1/current/${this.latitude}/${this.longitude}?lang=${this.language}`,
-            headers: {
-                ...this.headers,
-                Accept: "application/json",
-            },
-            timeout: QWEATHER_ALERT_TIMEOUT_SECONDS,
-        };
-        const requestStartedAt = Date.now();
-
         try {
-            const response = await fetch(request);
-            const body = JSON.parse(response?.body ?? "{}");
-            if (response?.ok === false) {
-                Console.warn("WeatherAlert", `upstreamStatus: ${response.statusCode ?? response.status}`);
-                return failedWeatherAlerts;
-            }
-            if (!body?.metadata || !Array.isArray(body?.alerts)) throw Error(JSON.stringify(body?.error ?? body?.code ?? body));
-            return this.#CreateWeatherAlerts(body);
+            return {
+                ...failedWeatherAlerts,
+                ...(await QWeather.FetchWeatherAlertPage(identifier, weatherKitLanguage, requestHeaders)),
+            };
         } catch (error) {
             const reason = error?.cause?.code || error?.cause?.message || error?.message || String(error);
-            Console.warn("WeatherAlert", `unavailable: ${reason}`);
+            Console.warn("WeatherAlertWeb", `unavailable: ${reason}`);
             return failedWeatherAlerts;
         } finally {
-            Console.info("WeatherAlert", `QWeather requestDuration: ${Date.now() - requestStartedAt}ms`, `timeout: ${QWEATHER_ALERT_TIMEOUT_SECONDS}s`);
-            Console.debug("✅ WeatherAlert");
+            Console.debug("✅ WeatherAlertWeb");
         }
     }
 
@@ -393,7 +542,7 @@ export default class QWeather {
                     forecastNextHour.forecastEnd = minuteStemp + 60 * forecastNextHour.minutes.length;
                     forecastNextHour.minutes = ForecastNextHour.Minute(forecastNextHour.minutes, body?.summary, "mmph");
                     forecastNextHour.summary = ForecastNextHour.Summary(forecastNextHour.minutes);
-                    forecastNextHour.condition = ForecastNextHour.Condition(forecastNextHour.summary);
+                    forecastNextHour.condition = ForecastNextHour.Condition(forecastNextHour.summary, forecastNextHour.metadata.readTime);
                     break;
                 }
                 case "204":
@@ -958,124 +1107,128 @@ export default class QWeather {
         };
     }
 
-    #CreateWeatherAlerts(body) {
-        const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
-        const attributions = Array.isArray(body?.metadata?.attributions) ? body.metadata.attributions : [];
-        const convertedAlerts = alerts.map(alert => this.#CreateWeatherAlert(alert)).filter(Boolean);
-        const attributionSource = attributions.find(item => item && !/延迟|过时|disclaimer|delayed|outdated/i.test(item)) || "国家预警信息发布中心";
-        return {
-            alerts: convertedAlerts,
-            areaName: convertedAlerts.find(alert => alert?.areaName)?.areaName ?? "",
-            source: convertedAlerts.find(alert => alert?.source)?.source || attributionSource,
+    static #NormalizeWeatherAlertColor(color, ...descriptions) {
+        const supportedCodes = new Set(["white", "gray", "green", "blue", "yellow", "amber", "orange", "red", "purple", "black"]);
+        let code = String(color?.code ?? color ?? "")
+            .trim()
+            .toLowerCase();
+        if (code === "grey") code = "gray";
+
+        if (!supportedCodes.has(code)) {
+            const text = descriptions.map(description => String(description ?? "")).join("\n");
+            const chineseMatch = text.match(/(琥珀|[白灰绿綠蓝藍黄黃橙红紅紫黑])色\s*(?:预警|預警|警报|警報|警示)/);
+            const chineseCodes = {
+                白: "white",
+                灰: "gray",
+                绿: "green",
+                綠: "green",
+                蓝: "blue",
+                藍: "blue",
+                黄: "yellow",
+                黃: "yellow",
+                琥珀: "amber",
+                橙: "orange",
+                红: "red",
+                紅: "red",
+                紫: "purple",
+                黑: "black",
+            };
+            code = chineseCodes[chineseMatch?.[1]];
+
+            if (!code) {
+                const englishMatch = text.match(/\b(white|gr[ae]y|green|blue|yellow|amber|orange|red|purple|black)\b(?=.{0,30}\b(?:alert|warning)\b)/i);
+                code = englishMatch?.[1]?.toLowerCase();
+                if (code === "grey") code = "gray";
+            }
+        }
+
+        return supportedCodes.has(code) ? code : undefined;
+    }
+
+    static #DecodeWeatherAlertPageHTML(value) {
+        const namedEntities = {
+            amp: "&",
+            apos: "'",
+            gt: ">",
+            lt: "<",
+            nbsp: " ",
+            quot: '"',
         };
-    }
-
-    #CreateWeatherAlert(alert) {
-        const issuedTime = this.#DateISOString(alert?.issuedTime || alert?.effectiveTime);
-        if (!issuedTime) return undefined;
-        const effectiveTime = this.#DateISOString(alert?.effectiveTime) || issuedTime;
-        const expireTime = this.#DateISOString(alert?.expiresTime || alert?.expireTime);
-        const eventOnsetTime = this.#DateISOString(alert?.eventOnsetTime || alert?.onsetTime || alert?.effectiveTime) || effectiveTime;
-        const eventEndTime = this.#DateISOString(alert?.eventEndTime || alert?.endTime || alert?.expiresTime || alert?.expireTime);
-        const guidelines = this.#SplitWeatherAlertGuidelines(alert?.instruction ?? alert?.instructions);
-        const description = this.#NormalizeWeatherAlertTitle(alert?.headline || alert?.eventType?.name || alert?.description);
-        const message = String(alert?.description ?? "").trim() || String(alert?.headline ?? description ?? "").trim();
-        const source = String(alert?.senderName ?? "").trim() || this.#ExtractWeatherAlertIssuer(alert?.headline || alert?.description);
-        const areaId = String(alert?.areaId ?? alert?.areaCode ?? "").trim();
-        const areaName = String(alert?.areaName ?? "").trim();
-        const phenomenon = String(alert?.eventType?.name ?? "").trim();
-        const token = String(alert?.token ?? alert?.eventType?.code ?? alert?.icon ?? "").trim();
-        const importance = this.#NormalizeWeatherAlertImportance(alert?.importance);
-        const significance = this.#NormalizeWeatherAlertSignificance(alert?.significance);
-
-        return {
-            ...(areaId ? { areaId } : {}),
-            ...(areaName ? { areaName } : {}),
-            certainty: this.#NormalizeWeatherAlertCertainty(alert?.certainty),
-            description,
-            effectiveTime,
-            ...(eventEndTime ? { eventEndTime } : {}),
-            eventOnsetTime,
-            ...(expireTime ? { expireTime } : {}),
-            guidelines,
-            identifier: alert?.id,
-            ...(importance ? { importance } : {}),
-            issuedTime,
-            message,
-            ...(phenomenon ? { phenomenon } : {}),
-            responses: Array.isArray(alert?.responseTypes) ? alert.responseTypes.map(response => String(response ?? "").trim()).filter(Boolean) : [],
-            reportedAt: issuedTime,
-            ...(significance ? { significance } : {}),
-            ...(source ? { source } : {}),
-            severity: this.#NormalizeWeatherAlertSeverity(alert?.severity),
-            standard: "",
-            ...(token ? { token } : {}),
-            urgency: this.#NormalizeWeatherAlertUrgency(alert?.urgency),
+        const decodeCodePoint = (match, value, radix) => {
+            const codePoint = Number.parseInt(value, radix);
+            return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
         };
+        return String(value ?? "")
+            .replace(/<br\s*\/?\s*>/gi, "\n")
+            .replace(/<[^>]*>/g, "")
+            .replace(/&#(\d+);/g, (match, number) => decodeCodePoint(match, number, 10))
+            .replace(/&#x([0-9a-f]+);/gi, (match, number) => decodeCodePoint(match, number, 16))
+            .replace(/&(amp|apos|gt|lt|nbsp|quot);/gi, (match, name) => namedEntities[name.toLowerCase()] ?? match)
+            .replace(/\r/g, "")
+            .replace(/[ \t]+\n/g, "\n")
+            .replace(/\n[ \t]+/g, "\n")
+            .replace(/[ \t]{2,}/g, " ")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim();
     }
 
-    #DateISOString(value) {
-        if (!value) return "";
-        const date = new Date(value);
-        return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+    static #FirstWeatherAlertPageMatch(source, pattern, fallback = "") {
+        const match = String(source ?? "").match(pattern);
+        return match ? QWeather.#DecodeWeatherAlertPageHTML(match[1]) : fallback;
     }
 
-    #NormalizeWeatherAlertSeverity(severity) {
-        const normalized = String(severity ?? "")
-            .trim()
-            .toLowerCase();
-        return ["extreme", "severe", "moderate", "minor"].includes(normalized) ? normalized : "unknown";
-    }
-
-    #NormalizeWeatherAlertCertainty(certainty) {
-        const normalized = String(certainty ?? "")
-            .trim()
-            .toLowerCase();
-        return ["observed", "likely", "possible", "unlikely", "unknown"].includes(normalized) ? normalized : "unknown";
-    }
-
-    #NormalizeWeatherAlertImportance(importance) {
-        const normalized = String(importance ?? "")
-            .trim()
-            .toLowerCase();
-        return ["high", "normal", "low"].includes(normalized) ? normalized : "";
-    }
-
-    #NormalizeWeatherAlertSignificance(significance) {
-        const normalized = String(significance ?? "")
-            .trim()
-            .toLowerCase();
-        return ["advisory", "watch", "warning", "statement", "emergency", "unknown"].includes(normalized) ? normalized : "";
-    }
-
-    #NormalizeWeatherAlertUrgency(urgency) {
-        const normalized = String(urgency ?? "")
-            .trim()
-            .toLowerCase();
-        return ["immediate", "expected", "future", "past", "unknown"].includes(normalized) ? normalized : "unknown";
-    }
-
-    #NormalizeWeatherAlertTitle(description) {
+    static #ParseWeatherAlertPageHeadline(description) {
         const title = String(description ?? "").trim();
-        const chinese = title.match(/^.+?发布\s*[:：]?\s*(.+)$/);
-        if (chinese?.[1]) return chinese[1].trim();
-        const english = title.match(/^.+?\s+(?:issues?|issued)\s*[:：]?\s*(.+)$/i);
-        return english?.[1]?.trim() || title;
+        const chinese = title.match(/^(.+?)(?:发布|發布|更新|解除|取消|撤销|撤消)\s*[:：]?\s*(.+)$/);
+        if (chinese?.[1] && chinese?.[2]) return { eventName: chinese[2].trim(), source: chinese[1].trim() };
+
+        const cap = title.match(/^(.+?)\s+issued\b[\s\S]*\s+by\s+(.+)$/i);
+        if (cap?.[1] && cap?.[2]) return { eventName: cap[1].trim(), source: cap[2].trim() };
+
+        const issued = title.match(/^(.+?)\s+issued\b\s*[:：]?\s*(.+)$/i);
+        if (issued?.[1] && issued?.[2]) {
+            const context = issued[2].trim();
+            const capContext = /^(?:for\b|\d{1,2}[/:.-]|\p{L}+\s+(?:\d{1,2}\b|at\b|until\b))/iu.test(context);
+            return capContext ? { eventName: issued[1].trim(), source: "" } : { eventName: context, source: issued[1].trim() };
+        }
+
+        const issues = title.match(/^(.+?)\s+issues?\b\s*[:：]?\s*(.+)$/i);
+        if (issues?.[1] && issues?.[2]) return { eventName: issues[2].trim(), source: issues[1].trim() };
+        return { eventName: title, source: "" };
     }
 
-    #ExtractWeatherAlertIssuer(description) {
-        const title = String(description ?? "").trim();
-        const chinese = title.match(/^(.+?)发布\s*[:：]?\s*(.+)$/);
-        if (chinese?.[1]) return chinese[1].trim();
-        const english = title.match(/^(.+?)\s+(?:issues?|issued)\s*[:：]?\s*(.+)$/i);
-        return english?.[1]?.trim() || "";
+    static #IsCancelledWeatherAlertText(...values) {
+        const text = values.map(value => String(value ?? "")).join("\n");
+        return /(?:解除|取消|撤销|撤消).{0,30}(?:预警|預警|警报|警報|警示)|\b(?:cancelled|canceled|all[ -]?clear)\b/i.test(text);
     }
 
-    #SplitWeatherAlertGuidelines(instruction) {
-        return String(instruction ?? "")
-            .split(/\r?\n/)
-            .map(line => line.replace(/^\s*\d+[.、]\s*/, "").trim())
-            .filter(Boolean);
+    static #WeatherAlertSeverityFromColor(colorCode) {
+        return (
+            {
+                white: "minor",
+                gray: "minor",
+                green: "minor",
+                blue: "minor",
+                yellow: "moderate",
+                amber: "moderate",
+                orange: "severe",
+                red: "extreme",
+                purple: "extreme",
+                black: "extreme",
+            }[colorCode] || "unknown"
+        );
+    }
+
+    static #WeatherAlertUrgencyFromColor(colorCode) {
+        return (
+            {
+                white: "future",
+                blue: "future",
+                yellow: "future",
+                orange: "expected",
+                red: "immediate",
+            }[colorCode] || "unknown"
+        );
     }
 
     #ConvertTimeStamp(fxDate, time) {

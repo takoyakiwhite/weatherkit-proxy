@@ -6,48 +6,18 @@ import Weather from "./Weather.mjs";
 export default class ColorfulClouds {
     constructor(parameters, token) {
         this.Name = "ColorfulClouds";
-        this.Version = "4.1.0";
+        this.Version = "4.2.1";
         Console.debug(`🟧 ${this.Name} v${this.Version}`);
         this.endpoint = `https://api.caiyunapp.com/v2.6/${token}/${parameters.longitude},${parameters.latitude}`;
         this.headers = { Referer: "https://caiyunapp.com/" };
         this.token = token;
         this.version = parameters.version;
-        switch (
-            String(parameters.language ?? "")
-                .trim()
-                .toLowerCase()
-        ) {
-            case "zh-cn":
-            case "zh-hans":
-            case "zh-hans-cn":
-            case "zh-sg":
-                this.language = "zh_CN";
-                break;
-            case "zh-hant":
-            case "zh-hant-hk":
-            case "zh-hant-mo":
-            case "zh-hant-tw":
-            case "zh-hk":
-            case "zh-mo":
-            case "zh-tw":
-                this.language = "zh_TW";
-                break;
-            case "ja":
-            case "ja-jp":
-                this.language = "ja";
-                break;
-            case "en-gb":
-                this.language = "en_GB";
-                break;
-            case "en-au":
-            case "en-ca":
-            case "en-us":
-                this.language = "en_US";
-                break;
-            case "":
-            default:
-                this.language = "zh_CN";
-        }
+        this.language =
+            this.#Config.Language[
+                String(parameters.language ?? "")
+                    .trim()
+                    .toLowerCase()
+            ] ?? this.#Config.Language[""];
         this.latitude = parameters.latitude;
         this.longitude = parameters.longitude;
         this.country = parameters.country;
@@ -59,6 +29,28 @@ export default class ColorfulClouds {
     };
 
     #Config = {
+        Language: {
+            "": "zh_CN",
+            ja: "ja",
+            "ja-jp": "ja",
+            en: "en_US",
+            "en-gb": "en_GB",
+            "en-au": "en_US",
+            "en-ca": "en_US",
+            "en-us": "en_US",
+            zh: "zh_CN",
+            "zh-cn": "zh_CN",
+            "zh-hans": "zh_CN",
+            "zh-hans-cn": "zh_CN",
+            "zh-sg": "zh_CN",
+            "zh-hant": "zh_TW",
+            "zh-hant-hk": "zh_TW",
+            "zh-hant-mo": "zh_TW",
+            "zh-hant-tw": "zh_TW",
+            "zh-hk": "zh_TW",
+            "zh-mo": "zh_TW",
+            "zh-tw": "zh_TW",
+        },
         Pollutants: {
             co: "CO",
             no: "NO",
@@ -69,33 +61,6 @@ export default class ColorfulClouds {
             pm25: "PM2_5",
             pm10: "PM10",
             other: "NOT_AVAILABLE",
-        },
-        WeatherAlert: {
-            Sources: {
-                1: "US National Weather Service",
-                2: "Environment and Climate Change Canada",
-            },
-            Severities: {
-                1: "extreme",
-                2: "severe",
-                3: "moderate",
-                4: "minor",
-                5: "unknown",
-            },
-            Certainties: {
-                1: "observed",
-                2: "likely",
-                3: "possible",
-                4: "unlikely",
-                5: "unknown",
-            },
-            Urgencies: {
-                1: "immediate",
-                2: "expected",
-                3: "future",
-                4: "past",
-                5: "unknown",
-            },
         },
         Availability: {
             Minutely: [
@@ -260,7 +225,7 @@ export default class ColorfulClouds {
                             forecastNextHour.forecastEnd = minuteStemp + 60 * forecastNextHour.minutes.length;
                             forecastNextHour.minutes = ForecastNextHour.Minute(forecastNextHour.minutes, body?.result?.minutely?.description, "mmph");
                             forecastNextHour.summary = ForecastNextHour.Summary(forecastNextHour.minutes);
-                            forecastNextHour.condition = ForecastNextHour.Condition(forecastNextHour.summary);
+                            forecastNextHour.condition = ForecastNextHour.Condition(forecastNextHour.summary, forecastNextHour.metadata.readTime);
                             break;
                         }
                         case "error":
@@ -281,38 +246,6 @@ export default class ColorfulClouds {
             Console.debug("✅ Minutely");
         }
         return forecastNextHour;
-    }
-
-    /** Fetch and normalize Caiyun's CAP weather-alert feed. */
-    async WeatherAlert() {
-        Console.debug("☑️ WeatherAlert");
-        const failedWeatherAlerts = {
-            alerts: [],
-            areaName: "",
-            source: "彩云天气",
-        };
-        const url = new URL("https://singer.caiyunhub.com/v3/cap_alert/location");
-        url.searchParams.set("token", this.token);
-        url.searchParams.set("longitude", this.longitude);
-        url.searchParams.set("latitude", this.latitude);
-        url.searchParams.set("language", this.language);
-
-        try {
-            const response = await fetch({ url: url.toString(), headers: this.headers, timeout: 3 });
-            const body = JSON.parse(response?.body ?? "{}");
-            if (response?.ok === false) {
-                Console.warn("WeatherAlert", `upstreamStatus: ${response.statusCode ?? response.status}`);
-                return failedWeatherAlerts;
-            }
-            if (!Array.isArray(body?.alerts)) throw Error(JSON.stringify(body?.error ?? body?.reason ?? body?.code ?? body));
-            return this.#CreateWeatherAlerts(body);
-        } catch (error) {
-            const reason = error?.cause?.code || error?.cause?.message || error?.message || String(error);
-            Console.warn("WeatherAlert", `unavailable: ${reason}`);
-            return failedWeatherAlerts;
-        } finally {
-            Console.debug("✅ WeatherAlert");
-        }
     }
 
     async #Hourly(hourlysteps = 273, begin = undefined) {
@@ -781,61 +714,5 @@ export default class ColorfulClouds {
                 windSpeed: hourly.result.hourly.wind[i].speed,
             })),
         };
-    }
-
-    #CreateWeatherAlerts(body) {
-        const convertedAlerts = (Array.isArray(body?.alerts) ? body.alerts : []).map(alert => this.#CreateWeatherAlert(alert)).filter(Boolean);
-        return {
-            alerts: convertedAlerts,
-            areaName: convertedAlerts.find(alert => alert?.areaName)?.areaName ?? "",
-            source: convertedAlerts.find(alert => alert?.source)?.source || "彩云天气",
-        };
-    }
-
-    #CreateWeatherAlert(alert) {
-        const config = this.#Config.WeatherAlert;
-        const issuedTime = this.#WeatherAlertDateISOString(alert?.sent_time);
-        if (!issuedTime) return undefined;
-        const effectiveTime = this.#WeatherAlertDateISOString(alert?.effective_time) || issuedTime;
-        const expireTime = this.#WeatherAlertDateISOString(alert?.expires_time);
-        const eventOnsetTime = this.#WeatherAlertDateISOString(alert?.onset_time) || effectiveTime;
-        const area = Array.isArray(alert?.areas) ? alert.areas.find(item => item) : undefined;
-        const geocode = Array.isArray(area?.geocodes) ? area.geocodes.find(item => item?.value) : undefined;
-        const description = String(alert?.event_name ?? alert?.headline ?? "").trim();
-        const message = String(alert?.description ?? alert?.headline ?? description).trim();
-        const source = String(alert?.sender_name ?? "").trim() || config.Sources[Number(alert?.source)] || "";
-
-        return {
-            ...(geocode?.value ? { areaId: String(geocode.value).trim() } : {}),
-            ...(area?.area_desc ? { areaName: String(area.area_desc).trim() } : {}),
-            certainty: config.Certainties[Number(alert?.certainty)] || "unknown",
-            description,
-            effectiveTime,
-            eventOnsetTime,
-            ...(expireTime ? { eventEndTime: expireTime, expireTime } : {}),
-            guidelines: this.#SplitWeatherAlertGuidelines(alert?.instruction),
-            identifier: alert?.id,
-            issuedTime,
-            message,
-            ...(description ? { phenomenon: description } : {}),
-            reportedAt: issuedTime,
-            severity: config.Severities[Number(alert?.severity)] || "unknown",
-            ...(source ? { source } : {}),
-            standard: "",
-            urgency: config.Urgencies[Number(alert?.urgency)] || "unknown",
-        };
-    }
-
-    #WeatherAlertDateISOString(value) {
-        const seconds = Number(value);
-        if (!Number.isFinite(seconds) || seconds <= 0) return "";
-        return new Date(seconds * 1000).toISOString();
-    }
-
-    #SplitWeatherAlertGuidelines(instruction) {
-        return String(instruction ?? "")
-            .split(/\r?\n/)
-            .map(line => line.replace(/^\s*\d+[.、]\s*/, "").trim())
-            .filter(Boolean);
     }
 }
